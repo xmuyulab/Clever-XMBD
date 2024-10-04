@@ -44,9 +44,9 @@ Our method requires a `.h5ad` file as input. The input AnnData should contain `a
 
 ## Usage
 
-Our model utilizes the labeled portion of the dataset for training purposes and then predicts the entire dataset (including the unlabelled portion). Use `data` to specify the dataset, `datadir` to specify the input data path, and `outdir` to specify the path for storing the results.
+Our model utilizes the labeled portion of the dataset for training purposes and then predicts the entire dataset (including the unlabelled portion). Use `data` to specify the dataset name, `datadir` for the input data directory, and `outdir` for the directory where the results will be stored. The `ungated` parameter indicates the labels of cells that were not assigned during the gating process.
 ```
-python run.py -data IMC_data -datadir example -outdir result -i x -wp x
+python run.py -data IMC_data -datadir example -outdir result -ungated unlabelled -i x -wp x
 ```
 - `i` (iterations): This hyperparameter specifies the number of training models.
 

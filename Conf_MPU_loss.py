@@ -4,7 +4,7 @@ import numpy as np
 class Conf_MPULoss(torch.nn.Module):
     """wrapper of loss function for MPU learning"""
 
-    def __init__(self, class_num , w_p=4, ncuda=0):
+    def __init__(self, class_num , w_p=5, ncuda=0):
         super().__init__()
         self.class_num = class_num
         self.w_p = w_p  # weight of positive_risk
@@ -15,7 +15,7 @@ class Conf_MPULoss(torch.nn.Module):
     
 
 
-def conf_mpu_loss(x, t, class_num, w_p=4, ncuda=0):
+def conf_mpu_loss(x, t, class_num, w_p=5, ncuda=0):
     """wrapper of loss function for Conf-MPU
     Args:
         x: Outputs of model.
@@ -35,29 +35,27 @@ def conf_mpu_loss(x, t, class_num, w_p=4, ncuda=0):
         prior_emp.append( float((t == i).float().sum())/ float(N))
         
     
-    def loss_per_class(x, t):
+    def loss_per_class(x, t, h_softmax, t_one_hot, num_classes):
         # Compute the loss for each class.
         
-        num_classes = x.size(1)
-        h_softmax = torch.nn.functional.softmax(x, dim=1)
-        t_one_hot = torch.nn.functional.one_hot(t, num_classes=num_classes).float()
-        losses = -t_one_hot * torch.log(h_softmax + 1e-9)
-        # Sum losses per class
-        class_losses = losses.sum(dim=0)
-        return class_losses
+        loss_pos = []
+        for i in range(num_classes-1):
+            class_mask = (t == i)
+            if class_mask.sum().float() == 0:
+                loss_pos.append(torch.tensor(0.).cuda(ncuda))
+            else:
+                loss_pos.append((-t_one_hot[class_mask, i] * torch.log(h_softmax[class_mask, i] + 1e-9)).sum())
+        
+        return loss_pos
     
 
-    def loss_per_class_neg(x, t):
+    def loss_per_class_neg(x, t, h_softmax, t_one_hot, num_classes):
         # Compute the negative loss for each class.
 
-        num_classes = x.size(1)
-        h_softmax = torch.nn.functional.softmax(x, dim=1)
-        t_one_hot = torch.nn.functional.one_hot(t, num_classes=num_classes).float()
-        
         p_class_neg = h_softmax[:, num_classes-1] # Consider only negative class
         loss_neg = []
         
-        for i in range(num_classes-1):
+        for i in range(num_classes):
             class_mask = (t == i)
             if class_mask.sum().float() == 0:
                 loss_neg.append(torch.tensor(0.).cuda(ncuda))
@@ -66,18 +64,15 @@ def conf_mpu_loss(x, t, class_num, w_p=4, ncuda=0):
                 loss_neg.append((-t_one_hot[class_mask, i] * torch.log(p_class_neg[class_mask] + 1e-9)).sum())
         return loss_neg
 
-    def conf_loss_per_class(x, t, threshold = 0.5):
+    def conf_loss_per_class(x, t, h_softmax, t_one_hot, num_classes, threshold = 0.5):
         #  Compute the confident based loss for each class.
         
-        num_classes = x.size(1)
-        h_softmax = torch.nn.functional.softmax(x, dim=1)
-        t_one_hot = torch.nn.functional.one_hot(t, num_classes=num_classes).float()
         loss_list = []
         for i in range(num_classes):
             if i < num_classes-1:
                 mask = (h_softmax[:, i] > threshold) & (t==i)
             else:
-                mask = torch.all(h_softmax <= threshold, dim=1) & (t==i) # Mask for predictions with all class probabilities below threshold
+                mask = torch.all(h_softmax <= threshold, dim=1) & (t==i)
 
             num_selected = mask.sum().float()
             # If no samples meet the condition, add zero loss and continue
@@ -98,9 +93,17 @@ def conf_mpu_loss(x, t, class_num, w_p=4, ncuda=0):
 
         return torch.stack(loss_list)
 
-    custom_loss_list = loss_per_class(x, t)
-    custom_loss_list_neg = loss_per_class_neg(x, t)
-    conf_loss_list = conf_loss_per_class(x, t)
+    def cal_mean_prob(h_softmax):
+        mean_softmax_probs = h_softmax.mean(dim=0)
+        return mean_softmax_probs
+
+    num_classes = x.size(1)
+    h_softmax = torch.nn.functional.softmax(x, dim=1)
+    t_one_hot = torch.nn.functional.one_hot(t, num_classes=num_classes).float()
+
+    custom_loss_list = loss_per_class(x, t, h_softmax, t_one_hot, num_classes)
+    custom_loss_list_neg = loss_per_class_neg(x, t, h_softmax, t_one_hot, num_classes)
+    conf_loss_list = conf_loss_per_class(x, t, h_softmax, t_one_hot, num_classes)
     # P(+)
     risk1 = sum([prior_emp[i]*custom_loss_list[i]/max([1., (t == i).float().sum()]) for i in range(class_num)])
 
@@ -113,10 +116,16 @@ def conf_mpu_loss(x, t, class_num, w_p=4, ncuda=0):
     # U'(-)
     risk4 = conf_loss_list[class_num]
 
+    # regularization term
+    r_a = torch.tensor(0., requires_grad=True).cuda(ncuda)
+    mean_softmax_probs = cal_mean_prob(h_softmax)
+    for c in range(class_num+1):
+        r_a += 1/(class_num+1) * torch.log(1/((class_num+1)*mean_softmax_probs[c]))
+
     positive_risk = w_p*(risk1 + risk2 - risk3)
     negative_risk = risk4
     if positive_risk < 0:
         positive_risk = torch.tensor(0., requires_grad=True).cuda(ncuda)
-    x_out =  positive_risk + negative_risk
+    x_out =  positive_risk + negative_risk + r_a
 
     return x_out

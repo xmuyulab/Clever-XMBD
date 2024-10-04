@@ -12,7 +12,8 @@ parser.add_argument("-datadir", type=str, help="data file directory", default='e
 parser.add_argument("-outdir", type=str, help="output result file directory", default='result')
 parser.add_argument("-ncuda", type=int, help="No. cuda", default=0)
 parser.add_argument("-i", type=int, help="iterations", default=5)
-parser.add_argument("-wp", type=float, help="weight of posotive risk", default=4)
+parser.add_argument("-wp", type=float, help="weight of posotive risk", default=5)
+parser.add_argument("-ungated", type=str, help="name of ungated cells", default='unlabelled')
 
 args = parser.parse_args()
 
@@ -23,7 +24,8 @@ if __name__ == "__main__":
     iterations = args.i
     w_p = args.wp
     random_seed = 1
-    neg_cell_type = ["unlabelled"]
+    neg_cell_type = [args.ungated]
+    neg_cell_type.append('Other')
 
     # Define paths for saving results and models
     save_path  = args.outdir
@@ -40,9 +42,14 @@ if __name__ == "__main__":
 
     prefix = "Clever_"+dataset+"_r"+str(random_seed)+"_i"+str(iterations)+"_wp"+str(w_p)
 
+    # Load the dataset, split into labeled and unlabeled data, and retrieve train and test indices
     (x_labeled, y_labeled),(x_unlabeled, y_unlabeled), train_index_list, test_index_list, \
-        label_num_transform, num_label_transform = load_dataset(dataset, data_path, neg_cell_type,lib_name='layer_1_gated',\
-                                                                ref_lib_name = 'celltype', k=iterations)
+        label_num_transform, num_label_transform = load_dataset(
+            dataset, data_path, neg_cell_type,
+            lib_name='layer_1_gated', # Cell types based on specific gating criteria
+            ref_lib_name = 'celltype', # Reference cell types provided by the data provider, used for comparison. If not available, you can set it to be the same as 'lib_name'.
+            k=iterations,
+            random_seed = random_seed)
 
     predict,prob = Clever(x_labeled , y_labeled, x_unlabeled, train_index_list, batchsize = 256, w_p = w_p, \
                           iterations = iterations, random_seed = random_seed, modelpath = model_path, \

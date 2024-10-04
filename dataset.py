@@ -1,7 +1,7 @@
 import numpy as np
 import scanpy as sc
 import pandas as pd
-from sklearn.model_selection import train_test_split
+import anndata
 from sklearn.model_selection import KFold
 from imblearn.over_sampling import SMOTE
 from sklearn.utils import resample
@@ -55,7 +55,7 @@ def num_to_label(num_label, num_label_transform):
     return label
 
 
-def get_data(dataset_name,datadir,neg_cell_type,lib_name,ref_lib_name):
+def get_data(dataset_name,datadir,neg_cell_type,lib_name,ref_lib_name, random_seed):
     """
     Loads and processes the dataset, splitting it into labeled and unlabeled sets.
     """
@@ -65,6 +65,23 @@ def get_data(dataset_name,datadir,neg_cell_type,lib_name,ref_lib_name):
     
     # Load the data from the file and extract the cell expression and cell type information.
     test_data = sc.read_h5ad(data_path)
+
+    # Oversampling
+    cell_counts = test_data.obs[lib_name].value_counts()
+    oversampled_data = []
+    for cell_type, count in cell_counts.items():
+        cells_of_type = test_data[test_data.obs[lib_name] == cell_type]
+        if count < 300:
+            # Oversampling to 300
+            resampled_cells = resample(cells_of_type, replace=True, n_samples=300 - count, random_state=random_seed)
+            new_index = ["oversample" + cell_type + "_" + str(i) for i in range(300 - count)]
+            resampled_cells.obs.index = new_index
+            cells_of_type = anndata.concat([resampled_cells, cells_of_type])
+        oversampled_data.append(cells_of_type)
+
+    test_data = anndata.concat(oversampled_data)
+    random_order = np.random.permutation(test_data.obs.index)
+    test_data = test_data[random_order]
 
     cell_exp = pd.DataFrame(test_data.X,index=test_data.obs.index,columns=test_data.var_names)
     cell_library = test_data.obs[lib_name]
@@ -116,9 +133,9 @@ def rename_negative_class(y_train, y_test,neg_cell_type):
     return y_test_bin
 
 
-def load_dataset(dataset_name,datadir,neg_cell_type,lib_name,ref_lib_name,k):
+def load_dataset(dataset_name,datadir,neg_cell_type,lib_name,ref_lib_name,k, random_seed):
     """
-    Loads the dataset and prepares it for K-fold cross-validation.
+    Loads the dataset.
 
     Args:
         dataset_name: The name of the dataset.
@@ -126,7 +143,7 @@ def load_dataset(dataset_name,datadir,neg_cell_type,lib_name,ref_lib_name,k):
         neg_cell_type: List of cell types considered as unalbelled.
         lib_name: The column name for gating cell types.
         ref_lib_name: The column name for reference cell types.
-        k: Number of folds for K-fold cross-validation.
+        k: Number of folds.
 
     Returns:
     """
@@ -146,9 +163,10 @@ def load_dataset(dataset_name,datadir,neg_cell_type,lib_name,ref_lib_name,k):
     
     #split labeled and unlabelled data
     (x_labeled, y_labeled), (x_unlabeled, y_unlabeled), y_unlabeled_ref, \
-        label_num_transform, num_label_transform = get_data(dataset_name,datadir,neg_cell_type,lib_name,ref_lib_name)
+        label_num_transform, num_label_transform = get_data(dataset_name,datadir,neg_cell_type,lib_name,ref_lib_name,random_seed)
     
     y_unlabeled = rename_negative_class(y_labeled, y_unlabeled,neg_cell_type)
+    y_unlabeled_ref = rename_negative_class(y_labeled, y_unlabeled_ref,neg_cell_type)
     
     #shuffle unlabelled set
     perm = np.random.permutation(len(y_unlabeled))
@@ -163,11 +181,11 @@ def load_dataset(dataset_name,datadir,neg_cell_type,lib_name,ref_lib_name,k):
 
 def make_kfold_dataloader(dataset, train_index_list, iteration, random_seed, balanced = False):
     """
-    Creates data loaders for K-fold cross-validation.
+    Creates data loaders.
 
     Args:
         dataset: Contains labeled and unlabeled cell expressions.
-        train_index_list: List of training indices for K-fold cross-validation.
+        train_index_list: List of training indices.
         iteration: Current fold iteration.
         random_seed: Seed for random number generator.
         balanced: Whether to balance the dataset using SMOTE.
@@ -208,16 +226,14 @@ def make_kfold_dataloader(dataset, train_index_list, iteration, random_seed, bal
                  
     (x_labeled, y_labeled, x_unlabeled) = dataset
 
-    # Split labeled data into training and validation sets
-    x_labeled_train, x_labeled_vali, y_labeled_train, y_labeled_vali = train_test_split(x_labeled, y_labeled,test_size=0.2,random_state=random_seed)
+    # Create training sets
+    x_labeled_train, y_labeled_train = x_labeled, y_labeled
 
     x_unlabel_train = split_unlabel(x_unlabeled,train_index_list,iteration)
 
     x_train, y_train = make_pu_dataset_from_multiclass_dataset(x_labeled_train, y_labeled_train, x_unlabel_train, balanced)
 
-    x_vali, y_vali = np.asarray(x_labeled_vali, dtype=np.float32), np.asarray(y_labeled_vali, dtype=np.int64)
     
     print("training:{}".format(x_train.shape))
-    print("validation:{}".format(x_labeled_vali.shape))
     
-    return x_train, y_train, x_vali, y_vali
+    return x_train, y_train

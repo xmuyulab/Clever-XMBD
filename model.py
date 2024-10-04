@@ -1,5 +1,6 @@
 from Conf_MPU_loss import Conf_MPULoss
 from dataset import make_kfold_dataloader
+from torch.optim import lr_scheduler
 from utils import *
 import torch
 from torch import nn
@@ -26,7 +27,7 @@ class ThreeLayerPerceptron(nn.Module):
         return out
 
 
-def training(model, class_num,train_dataloader, Xvali,Yvali,modelpath,lr = 0.01, num_epoch = 100, w_p = 4, ncuda = 0, prefix = "model"):
+def training(model, class_num,train_dataloader, modelpath,lr = 0.05, num_epoch = 200, w_p = 5, ncuda = 0, prefix = "model"):
     """
     Train model using Conf-MPU loss.
     
@@ -34,8 +35,6 @@ def training(model, class_num,train_dataloader, Xvali,Yvali,modelpath,lr = 0.01,
         model: The neural network model to train.
         class_num: Number of classes.
         train_dataloader: DataLoader for the training data.
-        Xvali: Validation data features.
-        Yvali: Validation data labels.
         modelpath: Path to save the trained model.
         lr: Learning rate.
         num_epoch: Number of epochs to train.
@@ -45,27 +44,39 @@ def training(model, class_num,train_dataloader, Xvali,Yvali,modelpath,lr = 0.01,
     Returns:
         model: Trained model.
     """
-    min_epoch = 50
-    min_f1 = 0
+    min_epoch = 30
+    last_epoch_loss = 0
 
-    model.train()
     optimizers = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-3)
+    scheduler=lr_scheduler.StepLR(optimizers, step_size=30, gamma=0.1)
+    loss_funcs = Conf_MPULoss(int(class_num-1), w_p, ncuda)
 
     if torch.cuda.is_available():
         print("use gpu")
         model.cuda(ncuda)
 
-    loss_funcs = Conf_MPULoss(int(class_num-1), w_p, ncuda)
-
     if os.path.exists(modelpath)==False:
         os.makedirs(modelpath)
 
+    # Obtain initial training data from train_dataloader
+    data_list = []
+    label_list = []
+    for data, labels in train_dataloader:
+        data_list.append(data)
+        label_list.append(labels)
+    data = torch.cat(data_list)
+    labels = torch.cat(label_list)
+
     # training loop
-    f1_vali = list()
+    n = 0
+    last_epoch_loss = 100
     for epoch in range(num_epoch):
+        model.train()
         step_loss = list()
 
-        # train
+        train_dataset = list(zip(data, labels))
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=train_dataloader.batch_size, shuffle=True, drop_last=True)
+        
         for x, t in train_dataloader:
             x, t = x.cuda(ncuda), t.cuda(ncuda)
             
@@ -79,19 +90,50 @@ def training(model, class_num,train_dataloader, Xvali,Yvali,modelpath,lr = 0.01,
 
             step_loss.append(loss.item())
 
-        f1_vali.append(evaluate_val(model,Xvali,Yvali,ncuda))
+        # Self-training
+        if abs(last_epoch_loss - np.mean(step_loss)) < 0.01:
+            # Predict unlabeled data and generate pseudo-labels
+            model.eval()
+            count_confidence = 0
+            with torch.no_grad():
+                new_data_list = []
+                new_label_list = []
+                for x, t in train_dataloader:
+                    x, t = x.cuda(ncuda), t.cuda(ncuda)
+                    h = model(x)
+                    probs = torch.softmax(h, dim=1)
+                    confidence, predicted_labels = torch.max(probs, dim=1)
+                    
+                    # Update only for unlabeled data
+                    unlabeled_mask = (t == class_num - 1)
+                    high_confidence_mask = confidence > 0.99
+                    combined_mask = unlabeled_mask & high_confidence_mask
 
+                    # Update labels
+                    t[combined_mask] = predicted_labels[combined_mask]
+                    count_confidence += len(predicted_labels[combined_mask])
+                    new_data_list.append(x.cpu())
+                    new_label_list.append(t.cpu())
+
+                data = torch.cat(new_data_list)
+                labels = torch.cat(new_label_list)
+
+        scheduler.step()
+        last_epoch_loss = np.mean(step_loss)
+
+        # Update weight for positive risk
+        if epoch==4:
+            loss_funcs = Conf_MPULoss(int(class_num-1), 1, ncuda)
 
         # early-stopping
         if epoch >= min_epoch:
-            if f1_vali[epoch] >= min_f1:
-                min_f1 = f1_vali[epoch]
+            if count_confidence == 0:
                 torch.save(model.state_dict(), modelpath+'/'+str(prefix)+'.pt')
-                n = 0
-            else:
                 n += 1
+            else:
+                n = 0
 
-            if n==10:
+            if n==5:
                 break
 
         sys.stdout.write('\r')
@@ -147,7 +189,7 @@ def get_average_predict(iterations,model_path,x_unlabeled,feature,class_num,pref
     return predict, prob
 
 
-def Clever(x_labeled , y_labeled, x_unlabeled,train_index_list=None, batchsize = 256, w_p = 10, iterations = 5, random_seed = 777, modelpath = "./",ncuda = 0, prefix = None):
+def Clever(x_labeled , y_labeled, x_unlabeled,train_index_list=None, batchsize = 256, w_p = 5, iterations = 5, random_seed = 777, modelpath = "./",ncuda = 0, prefix = None):
     """
     Main function to run the Clever workflow for training and prediction.
 
@@ -155,7 +197,7 @@ def Clever(x_labeled , y_labeled, x_unlabeled,train_index_list=None, batchsize =
         x_labeled: Labeled feature data.
         y_labeled: Labeled target data.
         x_unlabeled: Unlabeled feature data.
-        train_index_list: List of training indices for k-fold cross-validation.
+        train_index_list: List of training indices for k models.
         batchsize: Batch size for training.
         w_p: Weight for positive risk in Conf-MPU loss.
         iterations: Number of training iterations/models.
@@ -175,12 +217,12 @@ def Clever(x_labeled , y_labeled, x_unlabeled,train_index_list=None, batchsize =
 
     feature = list(x_labeled.columns)
     
-    if iterations>0:
+    if iterations>1:
         for iteration in range(iterations):
             print("Start iteration {}".format(iteration+1))
 
-            # Prepare data for k-fold cross-validation
-            x_train,y_train,x_vali, y_vali = make_kfold_dataloader((x_labeled, y_labeled,x_unlabeled),train_index_list, iteration,random_seed,balanced = False)
+            # Prepare data
+            x_train, y_train = make_kfold_dataloader((x_labeled, y_labeled,x_unlabeled),train_index_list, iteration,random_seed,balanced = False)
 
             #train loader
             train_dataset=list(zip(x_train,y_train))
@@ -192,7 +234,7 @@ def Clever(x_labeled , y_labeled, x_unlabeled,train_index_list=None, batchsize =
             model = ThreeLayerPerceptron(input_dim, class_num)
 
             # # Base classification model training
-            model = training(model, class_num, train_loader, x_vali, y_vali, modelpath, prefix = prefix+str(iteration), w_p= w_p, ncuda = ncuda)
+            model = training(model, class_num, train_loader, modelpath, prefix = prefix+str(iteration), w_p= w_p, ncuda = ncuda)
     else:
         raise NotImplementedError("The iteration number should be larger than 1")
     
